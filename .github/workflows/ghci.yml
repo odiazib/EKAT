@@ -1,0 +1,84 @@
+name: ghci
+
+on:
+  # Runs on PRs against master
+  pull_request:
+    branches: [ master ]
+    types: [opened, synchronize, ready_for_review, reopened]
+
+  # Allow manual runs
+  workflow_dispatch:
+
+  # Add schedule trigger for nightly runs at midnight MT (Standard Time)
+  schedule:
+    - cron: '0 7 * * *'  # Runs at 7 AM UTC, which is midnight MT during Standard Time
+
+concurrency:
+  # Two runs are in the same group if they are testing the same git ref
+  #  - if trigger=pull_request, the ref is refs/pull/<PR_NUMBER>/merge
+  #  - for other triggers, the ref is the branch tested
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --login {0}
+
+jobs:
+  tests:
+    runs-on: [self-hosted, e3sm, '${{ matrix.runner }}']
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [gnu, cuda, hip, intel]
+        build_type: [debug, release]
+    name: ${{ matrix.runner }} / ${{ matrix.build_type }}
+    steps:
+      - name: Show action trigger
+        uses: e3sm-project/automation/show-trigger@v1
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          show-progress: false
+          submodules: recursive
+      - name: Get GPU Arch
+        id: gpu
+        if: ${{ matrix.runner == 'cuda' || matrix.runner == 'hip' }}
+        uses: e3sm-project/automation/gpu-arch@v1
+      - name: Ensure CACTS is installed
+        env:
+          PIP_CERT: /etc/pki/tls/certs/ca-bundle.crt
+        run: |
+          python3 -m pip install --upgrade cacts
+      - name: Run tests
+        run: |
+          cmd="cacts -m ghci-snl-${{ matrix.runner }} -t ${{ matrix.build_type }} -r ./"
+
+          # Add the scheduler flag for nightly runs
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+              cmd+=" -s"
+          fi
+
+          # Runner-specific options
+          case "${{ matrix.runner }}" in
+              cuda|hip)
+                  # The "Get GPU Arch" step detected the GPU arch
+                  cmd+=" -c Kokkos_ARCH_${{ steps.gpu.outputs.kokkos-arch }}=ON"
+                  ;;
+              intel)
+                  cmd+=" -c CMAKE_CXX_FLAGS=-fp-model=precise"
+                  ;;
+          esac
+          echo "CACTS call: $cmd"
+          $cmd
+      - name: Upload files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-files-${{ matrix.build_type }}-ghci-snl-${{ matrix.runner }}
+          path: |
+            ctest-build/*/Testing/**
+            ctest-build/*/ctest_resource_file.json
+            ctest-build/*/ctest_script.cmake
+            ctest-build/*/CMakeCache.txt
